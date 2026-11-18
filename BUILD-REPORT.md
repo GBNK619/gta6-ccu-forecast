@@ -74,3 +74,33 @@ tuning harness, coverage 0.907 vs 0.904).
 - The prize bar is the better of the house baseline and the house model forecast **on the final
   day itself**; the backtest above says this model beats the baseline's method clearly on
   comparable launches, but the house model forecast's strength on the day is unknowable in advance.
+
+## v2 revision (2026-11-18) — similarity-weighted peers
+
+A second, deeper leave-one-out search replaced the unweighted fit with a similarity-weighted one
+and re-tuned every constant. Changes relative to the version above:
+
+- Each peer is weighted by the closeness of its hour-1 size to the case's hour-1 print,
+  `w = exp(−(ln v_1i − ln p)² / (2σ²))` with σ = 0.9; the per-hour median and scatter are the
+  weighted median and weighted RMS. The weight uses only hour-1 prints — no future information.
+- Peer threshold widened: hour-1 viewers ≥ 0.5% of the launch's own peak (was 1%).
+- Constants re-tuned: spread multiplier 0.85 (was 0.70), spread floor 0.22 (was 0.12), spread
+  growth 0.025 (was 0.30). Dispersion smoothing dropped (the weighted fit prefers the raw
+  per-hour scatter; the unweighted model's small preference for smoothing reversed).
+- Shrinkage γ on the median ratio re-tested at the new optimum and rejected again, monotonically.
+
+End-to-end leave-one-out with the shipped v2 program (same protocol as the table above — one
+synthetic case per held-out launch, exact pinball):
+
+| Model | LOO loss (30 live-at-hour-1 launches) | 90% coverage |
+|---|---|---|
+| **v2 (this entry)** | **0.331460** | 0.874 |
+| v1 (unweighted, above) | 0.415174 | 0.907 |
+| House baseline (persistence) | 0.461949 | 0.732 |
+
+The improvement is broad: 24 of the 30 held-out launches score better than under v1, and the
+margin survives removing the single hardest launch (mean per-launch loss excluding it still falls
+0.3131 → 0.2644). The band is narrower than nominal — it covers 87.4% of held-out hours rather
+than 90% — which the pinball score prefers; that trade is recorded here rather than hidden.
+Practice cases p00–p03 re-validated with the v2 program: outputs valid, byte-identical across
+runs, ≈75 ms per case.
