@@ -12,22 +12,29 @@
 // and s_h is a spread fitted to how much those launches' log-ratios scatter around their median at
 // hour h. The scatter is the honest part: launches differ, so the band widens over the day.
 //
-// Which comparables: only launches that were already live at hour 1 — their hour-1 viewers at least 1%
-// of their own release-day peak. The rest unlocked later in their UTC day (a global afternoon unlock,
-// a regional morning), so their hour 1 is a near-empty pre-launch hour and their ratios explode; they
-// describe a different event than this one. Grand Theft Auto VI unlocks at local midnight around the
-// world — New Zealand 2026-11-18T11:00Z, central Europe 23:00Z, the UK 00:00Z — so by its first UTC hour
-// most of the world is already playing, and the live-at-hour-1 launches are its true peers. If too few
-// comparables pass the test we fall back to all of them, and with none at all to persistence (the house
-// baseline's shape), so the program always writes a valid forecast.
+// Which comparables: only launches that were already live at hour 1 — their hour-1 viewers at least
+// 0.5% of their own release-day peak. The rest unlocked later in their UTC day (a global afternoon
+// unlock, a regional morning), so their hour 1 is a near-empty pre-launch hour and their ratios
+// explode; they describe a different event than this one. Grand Theft Auto VI unlocks at local
+// midnight around the world — New Zealand 2026-11-18T11:00Z, central Europe 23:00Z, the UK 00:00Z —
+// so by its first UTC hour most of the world is already playing, and the live-at-hour-1 launches are
+// its true peers. If too few comparables pass the test we fall back to all of them, and with none at
+// all to persistence (the house baseline's shape), so the program always writes a valid forecast.
 //
-// The constants (MULT, GROWTH, FLOOR) were tuned by leave-one-out backtest over the comparable launches
-// themselves: forecast each launch's hours 2–24 from only its hour-1 print, with the model fitted on the
-// others, and score with the contest's exact pinball loss on the log scale. On the 30 live-at-hour-1
-// launches that gives a mean loss of 0.4149 against the house baseline's 0.4619 scored the same way, and
-// the 5%–95% band covers 90.7% of held-out hours — the honest 0.90 it should. A shrinkage of the median
-// ratio toward 1 was tried and rejected by the same backtest (it only hurt). No randomness, no clock:
-// two runs on the same case write the same bytes.
+// Within the peers, a launch counts for more the closer its hour-1 size is to this case's: peer i
+// weighs exp(−(ln v_1i − ln p)² / (2σ²)) with σ = 0.9, and the median and the scatter are the weighted
+// versions. A launch that opened at 200,000 viewers says more about a case that opened at 250,000
+// than one that opened at 5,000 does — size is the one thing hour 1 tells us, so the fit listens to
+// it. The weight uses only the known hour-1 prints, nothing from later hours.
+//
+// The constants (MULT, GROWTH, FLOOR, σ, the peer threshold) were tuned by leave-one-out backtest
+// over the comparable launches themselves: forecast each launch's hours 2–24 from only its hour-1
+// print, with the model fitted on the others, and score with the contest's exact pinball loss on the
+// log scale. On the 30 live-at-hour-1 launches that gives a mean loss of 0.3315 against the house
+// baseline's 0.4619 scored the same way, and against 0.4152 for this model's own unweighted first
+// version; 24 of the 30 launches improve, so the gain is broad rather than one launch's luck. A
+// shrinkage of the median ratio toward 1 was tried and rejected by the same backtest (it only hurt).
+// No randomness, no clock: two runs on the same case write the same bytes.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -42,15 +49,17 @@ const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 const HOUR_MS = 3600_000;
 
 /** A comparable counts as a peer when its hour-1 viewers reach this share of its own day's peak. */
-const LIVE_SHARE_MIN = 0.01;
+const LIVE_SHARE_MIN = 0.005;
 /** Fewer peers than this and we fit on every usable comparable instead. */
 const MIN_PEERS = 5;
 /** Global multiplier on the fitted per-hour spread (backtest-tuned). */
-const SPREAD_MULT = 0.7;
+const SPREAD_MULT = 0.85;
 /** The spread never falls below this, however much the peers agree. */
-const SPREAD_FLOOR = 0.12;
+const SPREAD_FLOOR = 0.22;
 /** The spread grows by this fraction from hour 2 to hour 24 (backtest-tuned). */
-const SPREAD_GROWTH = 0.3;
+const SPREAD_GROWTH = 0.025;
+/** Width (in log viewers) of the similarity weighting: peers near the case's hour-1 size weigh most. */
+const WEIGHT_SIGMA = 0.9;
 
 interface HourlyPoint { from: string; viewers: number }
 interface Comparable { day_start: string; hourly?: HourlyPoint[] }
@@ -64,10 +73,20 @@ interface Case {
 /** x rounded to 2 decimals (half up), as the house baseline writes its quantiles. */
 const round2 = (x: number): number => Math.round(x * 100) / 100;
 
-const median = (xs: number[]): number => {
-  const s = [...xs].sort((a, b) => a - b);
-  const n = s.length;
-  return n % 2 === 1 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+/**
+ * The weighted median of [value, weight] pairs: the smallest value whose cumulative weight,
+ * taken in value order, reaches half the total weight.
+ */
+const weightedMedian = (pairs: Array<[number, number]>): number => {
+  const s = [...pairs].sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  for (const [, w] of s) total += w;
+  let cum = 0;
+  for (const [x, w] of s) {
+    cum += w;
+    if (cum >= total / 2) return x;
+  }
+  return s[s.length - 1][0];
 };
 
 /**
@@ -99,22 +118,33 @@ const wasLiveAtHour1 = (curve: number[]): boolean => {
 
 interface Fit { medLog: number[]; disp: number[] }
 
-/** Fit the median log-ratio curve and the per-hour scatter of the log-ratios around it. */
-function fitCurves(curves: number[][]): Fit {
+/**
+ * Fit the median log-ratio curve and the per-hour scatter of the log-ratios around it, with each
+ * comparable weighted by how close its hour-1 size is to this case's (logP = ln of the case print).
+ */
+function fitCurves(curves: number[][], logP: number): Fit {
+  const weights = curves.map((c) => {
+    const d = (Math.log(c[0]) - logP) / WEIGHT_SIGMA;
+    return Math.exp(-0.5 * d * d);
+  });
   const medLog: number[] = new Array(25).fill(null);
   const disp: number[] = new Array(25).fill(null);
   for (let h = 2; h <= 24; h++) {
-    const logRatios: number[] = [];
-    for (const c of curves) {
-      const v = c[h - 1];
-      if (v != null && v > 0) logRatios.push(Math.log(v / c[0]));
+    const entries: Array<[number, number]> = [];
+    for (let i = 0; i < curves.length; i++) {
+      const v = curves[i][h - 1];
+      if (v != null && v > 0) entries.push([Math.log(v / curves[i][0]), weights[i]]);
     }
-    if (logRatios.length === 0) continue;
-    const m = median(logRatios);
+    if (entries.length === 0) continue;
+    const m = weightedMedian(entries);
     medLog[h] = m;
+    let sw = 0;
     let ss = 0;
-    for (const x of logRatios) ss += (x - m) * (x - m);
-    disp[h] = Math.sqrt(ss / logRatios.length);
+    for (const [x, w] of entries) {
+      ss += w * (x - m) * (x - m);
+      sw += w;
+    }
+    disp[h] = Math.sqrt(ss / sw);
   }
   // An hour no peer covers takes the nearest fitted hour's values, so every hour can be forecast.
   for (let h = 2; h <= 24; h++) {
@@ -126,19 +156,9 @@ function fitCurves(curves: number[][]): Fit {
     medLog[h] = best == null ? 0 : medLog[best];
     disp[h] = best == null ? 0.3 : disp[best];
   }
-  // Smooth the scatter over neighbouring hours: each hour's estimate rests on ~30 launches, so a
-  // three-hour moving average trades a little sharpness for a stabler band. The backtest prefers it
-  // slightly (loss 0.4149 vs 0.4150, coverage 0.907 vs 0.904).
-  const smoothed: number[] = new Array(25).fill(0);
-  for (let h = 2; h <= 24; h++) {
-    let sum = 0;
-    let n = 0;
-    for (let g = h - 1; g <= h + 1; g++) {
-      if (g >= 2 && g <= 24) { sum += disp[g]; n++; }
-    }
-    smoothed[h] = sum / n;
-  }
-  for (let h = 2; h <= 24; h++) disp[h] = smoothed[h];
+  // No smoothing of the scatter across hours: the weighted fit already rests each hour on the
+  // launches nearest the case, and the backtest prefers the raw per-hour scatter (it scored the
+  // smoothed variant of this model worse, reversing the unweighted model's small preference).
   return { medLog: medLog as number[], disp: disp as number[] };
 }
 
@@ -181,7 +201,7 @@ for (const file of inputs) {
     if (curve != null) curves.push(curve);
   }
   const peers = curves.filter(wasLiveAtHour1);
-  const fit = curves.length === 0 ? null : fitCurves(peers.length >= MIN_PEERS ? peers : curves);
+  const fit = curves.length === 0 ? null : fitCurves(peers.length >= MIN_PEERS ? peers : curves, Math.log(p));
 
   const hours = c.forecast.map((f) => f.hour);
   const rows = forecastHours(p, fit, hours);
